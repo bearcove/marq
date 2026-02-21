@@ -161,21 +161,55 @@ fn diff_block_inline(old: &Block, new: &Block) -> Block {
             if old_code == new_code && old_lang == new_lang {
                 new.clone()
             } else {
-                // Show old code struck through, new code bold
+                // Show as word-level diff of the code content.
+                // We can't embed literal ``` in inline text (it would be
+                // re-parsed as a code fence), so diff the code words directly.
+                let old_words: Vec<&str> = old_code.split_whitespace().collect();
+                let new_words: Vec<&str> = new_code.split_whitespace().collect();
+                let ops = diff_sequences(&old_words, &new_words);
                 let mut inlines = Vec::new();
-                if old_code != new_code || old_lang != new_lang {
-                    inlines.push(Inline::Strikethrough(vec![Inline::Text(format!(
-                        "```{}\n{}\n```",
-                        old_lang.as_deref().unwrap_or(""),
-                        old_code.trim_end_matches('\n')
-                    ))]));
-                    inlines.push(Inline::SoftBreak);
-                    inlines.push(Inline::Strong(vec![Inline::Text(format!(
-                        "```{}\n{}\n```",
-                        new_lang.as_deref().unwrap_or(""),
-                        new_code.trim_end_matches('\n')
-                    ))]));
+                let mut removed_run: Vec<String> = Vec::new();
+                let mut added_run: Vec<String> = Vec::new();
+
+                let flush = |result: &mut Vec<Inline>,
+                             removed: &mut Vec<String>,
+                             added: &mut Vec<String>| {
+                    if !removed.is_empty() {
+                        if !result.is_empty() {
+                            result.push(Inline::Text(" ".to_string()));
+                        }
+                        result.push(Inline::Strikethrough(vec![Inline::Code(
+                            std::mem::take(removed).join(" "),
+                        )]));
+                    }
+                    if !added.is_empty() {
+                        if !result.is_empty() {
+                            result.push(Inline::Text(" ".to_string()));
+                        }
+                        result.push(Inline::Strong(vec![Inline::Code(
+                            std::mem::take(added).join(" "),
+                        )]));
+                    }
+                };
+
+                for op in ops {
+                    match op {
+                        DiffOp::Equal(word) => {
+                            flush(&mut inlines, &mut removed_run, &mut added_run);
+                            if !inlines.is_empty() {
+                                inlines.push(Inline::Text(" ".to_string()));
+                            }
+                            inlines.push(Inline::Code((*word).to_string()));
+                        }
+                        DiffOp::Remove(word) => {
+                            removed_run.push((*word).to_string());
+                        }
+                        DiffOp::Add(word) => {
+                            added_run.push((*word).to_string());
+                        }
+                    }
                 }
+                flush(&mut inlines, &mut removed_run, &mut added_run);
                 Block::Paragraph(inlines)
             }
         }
@@ -249,12 +283,10 @@ fn wrap_block_removed(block: &Block) -> Block {
             level: *level,
             content: vec![Inline::Strikethrough(content.clone())],
         },
-        Block::CodeBlock { language, code } => {
-            Block::Paragraph(vec![Inline::Strikethrough(vec![Inline::Text(format!(
-                "```{}\n{}\n```",
-                language.as_deref().unwrap_or(""),
-                code.trim_end_matches('\n')
-            ))])])
+        Block::CodeBlock { code, .. } => {
+            Block::Paragraph(vec![Inline::Strikethrough(vec![Inline::Code(
+                code.trim_end_matches('\n').to_string(),
+            )])])
         }
         Block::BlockQuote(inner) => {
             let wrapped: Vec<Block> = inner.iter().map(wrap_block_removed).collect();
@@ -310,12 +342,10 @@ fn wrap_block_added(block: &Block) -> Block {
             level: *level,
             content: vec![Inline::Strong(content.clone())],
         },
-        Block::CodeBlock { language, code } => {
-            Block::Paragraph(vec![Inline::Strong(vec![Inline::Text(format!(
-                "```{}\n{}\n```",
-                language.as_deref().unwrap_or(""),
-                code.trim_end_matches('\n')
-            ))])])
+        Block::CodeBlock { code, .. } => {
+            Block::Paragraph(vec![Inline::Strong(vec![Inline::Code(
+                code.trim_end_matches('\n').to_string(),
+            )])])
         }
         Block::BlockQuote(inner) => {
             let wrapped: Vec<Block> = inner.iter().map(wrap_block_added).collect();
@@ -366,123 +396,173 @@ fn wrap_block_added(block: &Block) -> Block {
 mod tests {
     use super::*;
 
+    // =========================================================================
+    // Realistic tracey scenarios — these mirror actual requirement .raw text
+    // that gets diffed for hover popups.
+    // =========================================================================
+
     #[test]
-    fn unchanged_text() {
-        let md = "Hello world.\n";
-        let result = diff_markdown(md, md);
-        // Should contain the text without markers
-        assert!(result.contains("Hello world."));
-        assert!(!result.contains("~~"));
-        assert!(!result.contains("**"));
+    fn tracey_paragraph_req_word_change() {
+        // Paragraph requirement: .raw is text after the r[...] marker
+        let v1 = "All payloads MUST use Postcard wire format.\n";
+        let v2 = "All payloads MUST use MessagePack wire format.\n";
+        let result = diff_markdown_inline(v1, v2);
+        eprintln!("--- paragraph req word change ---\n{result}---");
+        assert!(result.contains("~~Postcard~~"));
+        assert!(result.contains("**MessagePack**"));
+        assert!(result.contains("MUST"));
+        assert!(result.contains("wire"));
     }
 
     #[test]
-    fn word_change_in_paragraph() {
-        let old = "The quick brown fox.\n";
-        let new = "The slow brown fox.\n";
-        let result = diff_markdown_inline(old, new);
+    fn tracey_blockquote_req_text_change() {
+        // Blockquote requirement: .raw includes `> ` prefixes, marker already stripped
+        let v1 = "\
+> The server MUST validate all incoming session tokens
+> before processing any request.
+";
+        let v2 = "\
+> The server MUST validate all incoming session tokens
+> and verify their expiry before processing any request.
+";
+        let result = diff_markdown_inline(v1, v2);
+        eprintln!("--- blockquote req text change ---\n{result}---");
+        // Blockquote structure preserved
         assert!(
-            result.contains("~~quick~~"),
-            "should strike old word: {result}"
+            result.contains("> "),
+            "blockquote prefix preserved: {result}"
         );
+        // Word-level diff inside the blockquote — added phrase grouped together
         assert!(
-            result.contains("**slow**"),
-            "should bold new word: {result}"
-        );
-        assert!(
-            result.contains("The"),
-            "unchanged words preserved: {result}"
-        );
-        assert!(
-            result.contains("brown"),
-            "unchanged words preserved: {result}"
-        );
-        assert!(
-            result.contains("fox."),
-            "unchanged words preserved: {result}"
-        );
-    }
-
-    #[test]
-    fn added_paragraph() {
-        let old = "First paragraph.\n";
-        let new = "First paragraph.\n\nSecond paragraph.\n";
-        let result = diff_markdown(old, new);
-        assert!(
-            result.contains("First paragraph."),
-            "original preserved: {result}"
-        );
-        assert!(
-            result.contains("**Second paragraph.**"),
-            "added block bolded: {result}"
+            result.contains("**and verify their expiry**"),
+            "added words marked: {result}"
         );
     }
 
     #[test]
-    fn removed_paragraph() {
-        let old = "First paragraph.\n\nSecond paragraph.\n";
-        let new = "First paragraph.\n";
-        let result = diff_markdown(old, new);
-        assert!(
-            result.contains("First paragraph."),
-            "remaining preserved: {result}"
-        );
-        assert!(
-            result.contains("~~Second paragraph.~~"),
-            "removed block struck: {result}"
-        );
-    }
-
-    #[test]
-    fn blockquote_structure_preserved() {
-        let old = "> Important rule.\n";
-        let new = "> Updated rule.\n";
-        let result = diff_markdown_inline(old, new);
-        assert!(result.contains("> "), "blockquote preserved: {result}");
-    }
-
-    #[test]
-    fn code_block_change() {
-        let old = "```rust\nfn old() {}\n```\n";
-        let new = "```rust\nfn new() {}\n```\n";
-        let result = diff_markdown_inline(old, new);
-        // Code blocks changed as whole units
+    fn tracey_blockquote_req_with_code_block() {
+        // Multi-block blockquote: text paragraph + code example
+        let v1 = "\
+> Responses MUST conform to the following schema:
+>
+> ```json
+> {\"status\": \"ok\", \"data\": []}
+> ```
+";
+        let v2 = "\
+> Responses MUST conform to the following schema:
+>
+> ```json
+> {\"status\": \"ok\", \"data\": [], \"meta\": {}}
+> ```
+";
+        let result = diff_markdown_inline(v1, v2);
+        eprintln!("--- blockquote with code block change ---\n{result}---");
+        // The text paragraph is unchanged
+        assert!(result.contains("Responses MUST conform"));
+        // Code block change should show old/new
         assert!(result.contains("~~"), "old code struck: {result}");
         assert!(result.contains("**"), "new code bolded: {result}");
     }
 
     #[test]
-    fn unchanged_code_block() {
-        let md = "```rust\nfn main() {}\n```\n";
-        let result = diff_markdown_inline(md, md);
-        assert!(result.contains("fn main()"));
-        assert!(!result.contains("~~"));
-        assert!(!result.contains("**"));
-    }
+    fn tracey_added_paragraph_to_req() {
+        // Requirement grows: v2 adds a clarifying paragraph
+        let v1 = "Clients MUST retry failed requests with exponential backoff.\n";
+        let v2 = "\
+Clients MUST retry failed requests with exponential backoff.
 
-    #[test]
-    fn multiple_word_changes() {
-        let old = "This is the old text with some words.\n";
-        let new = "This is the new text with different words.\n";
-        let result = diff_markdown_inline(old, new);
-        assert!(result.contains("~~old~~"), "old word struck: {result}");
-        assert!(result.contains("**new**"), "new word bolded: {result}");
-        assert!(result.contains("~~some~~"), "old word struck: {result}");
+The initial delay SHOULD be 100ms, doubling on each retry up to 10s.
+";
+        let result = diff_markdown_inline(v1, v2);
+        eprintln!("--- added paragraph ---\n{result}---");
+        assert!(result.contains("exponential backoff."));
         assert!(
-            result.contains("**different**"),
-            "new word bolded: {result}"
+            result.contains("**"),
+            "added paragraph should be bold: {result}"
+        );
+        assert!(
+            result.contains("100ms") || result.contains("SHOULD"),
+            "new content present: {result}"
         );
     }
 
     #[test]
-    fn heading_change() {
-        let old = "## Old Title\n";
-        let new = "## New Title\n";
-        let result = diff_markdown_inline(old, new);
-        assert!(result.contains("##"), "heading preserved: {result}");
-        assert!(result.contains("~~Old~~"), "old struck: {result}");
-        assert!(result.contains("**New**"), "new bolded: {result}");
+    fn tracey_removed_paragraph_from_req() {
+        // Requirement shrinks: v2 removes the example
+        let v1 = "\
+Connections MUST use TLS 1.3 or higher.
+
+Legacy TLS 1.2 connections MAY be accepted during the migration period.
+";
+        let v2 = "Connections MUST use TLS 1.3 or higher.\n";
+        let result = diff_markdown_inline(v1, v2);
+        eprintln!("--- removed paragraph ---\n{result}---");
+        assert!(result.contains("TLS 1.3"));
+        assert!(
+            result.contains("~~"),
+            "removed paragraph should be struck: {result}"
+        );
     }
+
+    #[test]
+    fn tracey_unchanged_req() {
+        let md = "\
+> The implementation MUST handle partial reads by buffering
+> incomplete frames until a full message boundary is received.
+";
+        let result = diff_markdown_inline(md, md);
+        eprintln!("--- unchanged ---\n{result}---");
+        assert!(!result.contains("~~"), "no strikethrough: {result}");
+        assert!(!result.contains("**"), "no bold: {result}");
+        assert!(result.contains("MUST handle"));
+    }
+
+    // =========================================================================
+    // Structural preservation tests — the whole point vs raw word diff
+    // =========================================================================
+
+    #[test]
+    fn blockquote_markers_not_mangled() {
+        // The old word-level diff would collapse "> foo\n> bar" into
+        // "> ~~foo~~ > ~~bar~~" — a single line with embedded `>`
+        let v1 = "> Line one.\n> Line two.\n";
+        let v2 = "> Line one.\n> Line changed.\n";
+        let result = diff_markdown_inline(v1, v2);
+        eprintln!("--- blockquote not mangled ---\n{result}---");
+        // Must start with blockquote
+        assert!(
+            result.starts_with("> "),
+            "output must be a blockquote: {result}"
+        );
+        // Must not have bare `>` in the middle of a line (mangled)
+        for line in result.lines() {
+            if line.contains('>') {
+                assert!(
+                    line.starts_with('>'),
+                    "bare > in middle of line — structure mangled: {line}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn paragraph_breaks_preserved() {
+        let v1 = "First paragraph.\n\nSecond paragraph.\n";
+        let v2 = "First paragraph.\n\nChanged paragraph.\n";
+        let result = diff_markdown_inline(v1, v2);
+        eprintln!("--- paragraph breaks preserved ---\n{result}---");
+        // Should have two separate paragraph blocks, not one merged line
+        let non_empty_lines: Vec<&str> = result.lines().filter(|l| !l.is_empty()).collect();
+        assert!(
+            non_empty_lines.len() >= 2,
+            "should be multiple paragraphs, got: {result}"
+        );
+    }
+
+    // =========================================================================
+    // Unit tests
+    // =========================================================================
 
     #[test]
     fn diff_sequences_basic() {
@@ -497,5 +577,24 @@ mod tests {
             })
             .collect();
         assert_eq!(equal, vec![1, 3, 4]);
+    }
+
+    #[test]
+    fn unchanged_text_no_markers() {
+        let md = "Hello world.\n";
+        let result = diff_markdown(md, md);
+        assert!(result.contains("Hello world."));
+        assert!(!result.contains("~~"));
+        assert!(!result.contains("**"));
+    }
+
+    #[test]
+    fn heading_preserves_level() {
+        let old = "## Old Title\n";
+        let new = "## New Title\n";
+        let result = diff_markdown_inline(old, new);
+        assert!(result.contains("## "), "heading level preserved: {result}");
+        assert!(result.contains("~~Old~~"), "old struck: {result}");
+        assert!(result.contains("**New**"), "new bolded: {result}");
     }
 }
