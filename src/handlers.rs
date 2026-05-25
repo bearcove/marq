@@ -11,6 +11,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+#[cfg(feature = "highlight")]
 use std::sync::Arc;
 
 use crate::Result;
@@ -586,6 +587,7 @@ document.addEventListener('hotmeal:opaque-changed', async (e) => {
 }
 
 /// A parsed section from a compare block.
+#[cfg(feature = "highlight")]
 #[derive(Debug, Clone)]
 pub struct CompareSection {
     /// Language identifier for syntax highlighting
