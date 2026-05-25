@@ -113,8 +113,15 @@ struct HtmlRenderState {
 /// Options for rendering markdown.
 #[derive(Default)]
 pub struct RenderOptions {
-    /// Source file path (for relative link resolution)
+    /// Source file path for relative link resolution.
     pub source_path: Option<String>,
+
+    /// Whether to emit `data-source-line` and `data-source-file` attributes in HTML.
+    ///
+    /// This is useful for development tooling that maps rendered HTML back to
+    /// markdown source, but production builds can leave it disabled to keep the
+    /// rendered HTML clean.
+    pub source_locations: bool,
 
     /// Code block handlers keyed by language
     pub code_handlers: HashMap<String, BoxedHandler>,
@@ -164,9 +171,15 @@ impl RenderOptions {
         self
     }
 
-    /// Set the source file path for link resolution and paragraph source attributes.
+    /// Set the source file path for link resolution.
     pub fn with_source_path(mut self, path: &str) -> Self {
         self.source_path = Some(path.to_string());
+        self
+    }
+
+    /// Configure whether rendered block elements include source location attributes.
+    pub fn with_source_locations(mut self, enabled: bool) -> Self {
+        self.source_locations = enabled;
         self
     }
 
@@ -1106,6 +1119,10 @@ fn blockquote_class_attr(kind: Option<BlockQuoteKind>) -> &'static str {
 }
 
 fn source_attrs(options: &RenderOptions, source_info: Option<SourceInfo>) -> String {
+    if !options.source_locations {
+        return String::new();
+    }
+
     let Some(info) = source_info else {
         return String::new();
     };
@@ -2123,7 +2140,8 @@ Second paragraph.
 
 Third paragraph.
 "#;
-        let doc = render(md, &RenderOptions::default()).await.unwrap();
+        let opts = RenderOptions::default().with_source_locations(true);
+        let doc = render(md, &opts).await.unwrap();
 
         // Check that paragraphs have data-source-line attributes
         assert!(
@@ -2148,6 +2166,7 @@ Third paragraph.
         let md = "A paragraph with source file info.";
         let opts = RenderOptions {
             source_path: Some("docs/test.md".to_string()),
+            source_locations: true,
             ..Default::default()
         };
         let doc = render(md, &opts).await.unwrap();
@@ -2160,6 +2179,32 @@ Third paragraph.
         assert!(
             doc.html.contains(r#"data-source-file="docs/test.md""#),
             "Should have file attribute: {}",
+            doc.html
+        );
+    }
+
+    #[tokio::test]
+    async fn test_source_locations_are_opt_in() {
+        let md = "# Title\n\nA paragraph with [a link](other.md).";
+        let opts = RenderOptions {
+            source_path: Some("docs/test.md".to_string()),
+            ..Default::default()
+        };
+        let doc = render(md, &opts).await.unwrap();
+
+        assert!(
+            doc.html.contains(r#"href="/docs/other/""#),
+            "source_path should still resolve links: {}",
+            doc.html
+        );
+        assert!(
+            !doc.html.contains("data-source-line"),
+            "source locations should be disabled by default: {}",
+            doc.html
+        );
+        assert!(
+            !doc.html.contains("data-source-file"),
+            "source files should be disabled by default: {}",
             doc.html
         );
     }
@@ -2184,6 +2229,7 @@ Third paragraph.
 "#;
         let opts = RenderOptions {
             source_path: Some("docs/test.md".to_string()),
+            source_locations: true,
             ..Default::default()
         };
         let doc = render(md, &opts).await.unwrap();
