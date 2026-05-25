@@ -4,7 +4,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::sync::Arc;
 
-use pulldown_cmark::{CodeBlockKind, Event, MetadataBlockKind, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{
+    Alignment, BlockQuoteKind, CodeBlockKind, Event, MetadataBlockKind, Options, Parser, Tag,
+    TagEnd,
+};
 
 use crate::Result;
 use crate::frontmatter::{Frontmatter, FrontmatterFormat};
@@ -98,6 +101,13 @@ pub enum DocElement {
     Req(ReqDefinition),
     /// A regular paragraph (not a requirement)
     Paragraph(Paragraph),
+}
+
+#[derive(Default)]
+struct HtmlRenderState {
+    table_alignments: Vec<Alignment>,
+    table_in_head: bool,
+    table_cell_index: usize,
 }
 
 /// Options for rendering markdown.
@@ -294,6 +304,7 @@ pub async fn render(markdown: &str, options: &RenderOptions) -> Result<Document>
     let mut code_samples: Vec<CodeSample> = Vec::new();
     let mut inline_code_spans: Vec<InlineCodeSpan> = Vec::new();
     let mut head_injection_map: BTreeMap<String, String> = BTreeMap::new();
+    let mut html_state = HtmlRenderState::default();
 
     // Output HTML - built directly as we process
     let mut html = String::new();
@@ -433,7 +444,8 @@ pub async fn render(markdown: &str, options: &RenderOptions) -> Result<Document>
                                 parent_events.append(&mut events);
                             }
                         } else {
-                            render_events_to_html(&mut html, &events, options, None).await;
+                            render_events_to_html(&mut html, &events, options, markdown, None)
+                                .await;
                         }
                     }
                     continue;
@@ -548,9 +560,10 @@ pub async fn render(markdown: &str, options: &RenderOptions) -> Result<Document>
 
                     // Emit the heading HTML
                     html.push_str(&format!(
-                        "<h{} id=\"{}\">{}</h{}>",
+                        "<h{} id=\"{}\"{}>{}</h{}>",
                         current_level,
                         html_escape(&id),
+                        source_attrs(options, Some(SourceInfo { line })),
                         html_escape(&heading_text),
                         current_level
                     ));
@@ -618,8 +631,14 @@ pub async fn render(markdown: &str, options: &RenderOptions) -> Result<Document>
                         line,
                         offset: start_offset,
                     }));
-                    render_events_to_html(&mut html, &events, options, Some(SourceInfo { line }))
-                        .await;
+                    render_events_to_html(
+                        &mut html,
+                        &events,
+                        options,
+                        markdown,
+                        Some(SourceInfo { line }),
+                    )
+                    .await;
                 }
             }
 
@@ -786,7 +805,16 @@ pub async fn render(markdown: &str, options: &RenderOptions) -> Result<Document>
                     events.push((event, range));
                 } else if !stack_contains(&context_stack, |c| c.is_metadata()) {
                     // Render directly using pulldown_cmark for other events
-                    pulldown_cmark::html::push_html(&mut html, std::iter::once(event.clone()));
+                    if !render_source_block_event(
+                        &mut html,
+                        &event,
+                        &range,
+                        options,
+                        markdown,
+                        &mut html_state,
+                    ) {
+                        pulldown_cmark::html::push_html(&mut html, std::iter::once(event.clone()));
+                    }
                 }
             }
         }
@@ -818,21 +846,20 @@ async fn render_events_to_html(
     html: &mut String,
     events: &[(Event<'_>, Range<usize>)],
     options: &RenderOptions,
+    markdown: &str,
     source_info: Option<SourceInfo>,
 ) {
+    let mut html_state = HtmlRenderState::default();
     let mut i = 0;
     while i < events.len() {
-        let (event, _range) = &events[i];
+        let (event, range) = &events[i];
         match event {
             Event::Start(Tag::Paragraph) => {
                 // Custom paragraph rendering with source location attributes
-                let mut attrs = String::new();
-                if let Some(ref info) = source_info {
-                    attrs.push_str(&format!(" data-source-line=\"{}\"", info.line));
-                    if let Some(ref file) = options.source_path {
-                        attrs.push_str(&format!(" data-source-file=\"{}\"", html_escape(file)));
-                    }
-                }
+                let info = source_info.unwrap_or_else(|| SourceInfo {
+                    line: offset_to_line(markdown, range.start),
+                });
+                let attrs = source_attrs(options, Some(info));
                 html.push_str(&format!("<p{}>", attrs));
             }
             Event::End(TagEnd::Paragraph) => {
@@ -899,13 +926,210 @@ async fn render_events_to_html(
                 ));
             }
             _ => {
-                pulldown_cmark::html::push_html(html, std::iter::once(event.clone()));
+                if !render_source_block_event(
+                    html,
+                    event,
+                    range,
+                    options,
+                    markdown,
+                    &mut html_state,
+                ) {
+                    pulldown_cmark::html::push_html(html, std::iter::once(event.clone()));
+                }
             }
         }
         i += 1;
     }
 }
+
+fn render_source_block_event(
+    html: &mut String,
+    event: &Event<'_>,
+    range: &Range<usize>,
+    options: &RenderOptions,
+    markdown: &str,
+    state: &mut HtmlRenderState,
+) -> bool {
+    let attrs = source_attrs(
+        options,
+        Some(SourceInfo {
+            line: offset_to_line(markdown, range.start),
+        }),
+    );
+
+    match event {
+        Event::Start(Tag::BlockQuote(kind)) => {
+            ensure_block_boundary(html);
+            let class_attr = blockquote_class_attr(*kind);
+            html.push_str(&format!("<blockquote{}{}>\n", class_attr, attrs));
+            true
+        }
+        Event::End(TagEnd::BlockQuote(_)) => {
+            html.push_str("</blockquote>\n");
+            true
+        }
+        Event::Start(Tag::List(Some(1))) => {
+            ensure_block_boundary(html);
+            html.push_str(&format!("<ol{}>\n", attrs));
+            true
+        }
+        Event::Start(Tag::List(Some(start))) => {
+            ensure_block_boundary(html);
+            html.push_str(&format!("<ol start=\"{}\"{}>\n", start, attrs));
+            true
+        }
+        Event::Start(Tag::List(None)) => {
+            ensure_block_boundary(html);
+            html.push_str(&format!("<ul{}>\n", attrs));
+            true
+        }
+        Event::End(TagEnd::List(true)) => {
+            html.push_str("</ol>\n");
+            true
+        }
+        Event::End(TagEnd::List(false)) => {
+            html.push_str("</ul>\n");
+            true
+        }
+        Event::Start(Tag::Item) => {
+            if !html.ends_with('\n') {
+                html.push('\n');
+            }
+            html.push_str(&format!("<li{}>", attrs));
+            true
+        }
+        Event::End(TagEnd::Item) => {
+            html.push_str("</li>\n");
+            true
+        }
+        Event::Start(Tag::DefinitionList) => {
+            ensure_block_boundary(html);
+            html.push_str(&format!("<dl{}>\n", attrs));
+            true
+        }
+        Event::End(TagEnd::DefinitionList) => {
+            html.push_str("</dl>\n");
+            true
+        }
+        Event::Start(Tag::DefinitionListTitle) => {
+            if !html.ends_with('\n') {
+                html.push('\n');
+            }
+            html.push_str(&format!("<dt{}>", attrs));
+            true
+        }
+        Event::End(TagEnd::DefinitionListTitle) => {
+            html.push_str("</dt>\n");
+            true
+        }
+        Event::Start(Tag::DefinitionListDefinition) => {
+            if !html.ends_with('\n') {
+                html.push('\n');
+            }
+            html.push_str(&format!("<dd{}>", attrs));
+            true
+        }
+        Event::End(TagEnd::DefinitionListDefinition) => {
+            html.push_str("</dd>\n");
+            true
+        }
+        Event::Rule => {
+            ensure_block_boundary(html);
+            html.push_str(&format!("<hr{} />\n", attrs));
+            true
+        }
+        Event::Start(Tag::Table(alignments)) => {
+            state.table_alignments.clone_from(alignments);
+            state.table_in_head = true;
+            state.table_cell_index = 0;
+            ensure_block_boundary(html);
+            html.push_str(&format!("<table{}>", attrs));
+            true
+        }
+        Event::End(TagEnd::Table) => {
+            html.push_str("</tbody></table>\n");
+            state.table_alignments.clear();
+            state.table_in_head = false;
+            state.table_cell_index = 0;
+            true
+        }
+        Event::Start(Tag::TableHead) => {
+            state.table_in_head = true;
+            state.table_cell_index = 0;
+            html.push_str(&format!("<thead{}><tr{}>", attrs, attrs));
+            true
+        }
+        Event::End(TagEnd::TableHead) => {
+            html.push_str("</tr></thead><tbody>\n");
+            state.table_in_head = false;
+            true
+        }
+        Event::Start(Tag::TableRow) => {
+            state.table_cell_index = 0;
+            html.push_str(&format!("<tr{}>", attrs));
+            true
+        }
+        Event::End(TagEnd::TableRow) => {
+            html.push_str("</tr>\n");
+            true
+        }
+        Event::Start(Tag::TableCell) => {
+            let tag = if state.table_in_head { "th" } else { "td" };
+            html.push_str(&format!("<{}{}>", tag, table_cell_attrs(state, attrs)));
+            true
+        }
+        Event::End(TagEnd::TableCell) => {
+            let tag = if state.table_in_head { "th" } else { "td" };
+            html.push_str(&format!("</{}>", tag));
+            state.table_cell_index += 1;
+            true
+        }
+        _ => false,
+    }
+}
+
+fn ensure_block_boundary(html: &mut String) {
+    if !html.is_empty() && !html.ends_with('\n') {
+        html.push('\n');
+    }
+}
+
+fn blockquote_class_attr(kind: Option<BlockQuoteKind>) -> &'static str {
+    match kind {
+        None => "",
+        Some(BlockQuoteKind::Note) => " class=\"markdown-alert-note\"",
+        Some(BlockQuoteKind::Tip) => " class=\"markdown-alert-tip\"",
+        Some(BlockQuoteKind::Important) => " class=\"markdown-alert-important\"",
+        Some(BlockQuoteKind::Warning) => " class=\"markdown-alert-warning\"",
+        Some(BlockQuoteKind::Caution) => " class=\"markdown-alert-caution\"",
+    }
+}
+
+fn source_attrs(options: &RenderOptions, source_info: Option<SourceInfo>) -> String {
+    let Some(info) = source_info else {
+        return String::new();
+    };
+
+    let mut attrs = format!(" data-source-line=\"{}\"", info.line);
+    if let Some(ref file) = options.source_path {
+        attrs.push_str(&format!(" data-source-file=\"{}\"", html_escape(file)));
+    }
+    attrs
+}
+
+fn table_cell_attrs(state: &HtmlRenderState, mut attrs: String) -> String {
+    match state.table_alignments.get(state.table_cell_index) {
+        Some(Alignment::Left) => attrs.push_str(" style=\"text-align: left\""),
+        Some(Alignment::Center) => attrs.push_str(" style=\"text-align: center\""),
+        Some(Alignment::Right) => attrs.push_str(" style=\"text-align: right\""),
+        Some(Alignment::None) | None => {}
+    }
+
+    attrs
+}
+
 /// Source location information for rendered elements
+#[derive(Clone, Copy)]
 struct SourceInfo {
     line: usize,
 }
@@ -1762,7 +1986,7 @@ r[req.two] Second.
 
         assert_eq!(doc.reqs.len(), 0);
         assert!(
-            doc.html.contains("<blockquote>"),
+            doc.html.contains("<blockquote"),
             "Regular blockquote should be preserved: {}",
             doc.html
         );
@@ -1938,6 +2162,57 @@ Third paragraph.
             "Should have file attribute: {}",
             doc.html
         );
+    }
+
+    #[tokio::test]
+    async fn test_block_elements_have_source_location_attributes() {
+        let md = r#"# Title
+
+- first
+- second
+
+1. one
+2. two
+
+> quoted
+
+---
+
+| A | B |
+| - | -: |
+| x | y |
+"#;
+        let opts = RenderOptions {
+            source_path: Some("docs/test.md".to_string()),
+            ..Default::default()
+        };
+        let doc = render(md, &opts).await.unwrap();
+
+        for expected in [
+            r#"<h1 id="title" data-source-line="1" data-source-file="docs/test.md">Title</h1>"#,
+            r#"<ul data-source-line="3" data-source-file="docs/test.md">"#,
+            r#"<li data-source-line="3" data-source-file="docs/test.md">"#,
+            r#"<li data-source-line="4" data-source-file="docs/test.md">"#,
+            r#"<ol data-source-line="6" data-source-file="docs/test.md">"#,
+            r#"<li data-source-line="6" data-source-file="docs/test.md">"#,
+            r#"<li data-source-line="7" data-source-file="docs/test.md">"#,
+            r#"<blockquote data-source-line="9" data-source-file="docs/test.md">"#,
+            r#"<p data-source-line="9" data-source-file="docs/test.md">"#,
+            r#"<hr data-source-line="11" data-source-file="docs/test.md" />"#,
+            r#"<table data-source-line="13" data-source-file="docs/test.md">"#,
+            r#"<thead data-source-line="13" data-source-file="docs/test.md"><tr data-source-line="13" data-source-file="docs/test.md">"#,
+            r#"<th data-source-line="13" data-source-file="docs/test.md">"#,
+            r#"<th data-source-line="13" data-source-file="docs/test.md" style="text-align: right">"#,
+            r#"<tr data-source-line="15" data-source-file="docs/test.md">"#,
+            r#"<td data-source-line="15" data-source-file="docs/test.md">"#,
+            r#"<td data-source-line="15" data-source-file="docs/test.md" style="text-align: right">"#,
+        ] {
+            assert!(
+                doc.html.contains(expected),
+                "expected {expected:?} in HTML:\n{}",
+                doc.html
+            );
+        }
     }
 
     // =========================================================================
