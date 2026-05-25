@@ -212,14 +212,21 @@ impl RenderOptions {
 
 /// Opaque ID for a rendered HTML element that has a source-map entry.
 ///
-/// Source IDs are scoped to one rendered [`Document`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SourceId(u32);
+/// Source IDs are scoped to one rendered [`Document`]. They are derived from
+/// the markdown construct and source slice, so unrelated insertions elsewhere
+/// in the document do not renumber every following element.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SourceId(String);
 
 impl SourceId {
-    /// Return the numeric ID emitted in `data-sid`.
-    pub fn get(self) -> u32 {
-        self.0
+    /// Return the ID emitted in `data-sid`.
+    pub fn get(&self) -> &str {
+        &self.0
+    }
+
+    /// Return the ID emitted in `data-sid`.
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -246,6 +253,27 @@ pub enum SourceKind {
     TableRow,
     TableCell,
     Image,
+}
+
+impl SourceKind {
+    fn stable_tag(self) -> &'static str {
+        match self {
+            SourceKind::Heading => "heading",
+            SourceKind::Paragraph => "paragraph",
+            SourceKind::BlockQuote => "blockquote",
+            SourceKind::List => "list",
+            SourceKind::ListItem => "list-item",
+            SourceKind::DefinitionList => "definition-list",
+            SourceKind::DefinitionListTitle => "definition-list-title",
+            SourceKind::DefinitionListDefinition => "definition-list-definition",
+            SourceKind::ThematicBreak => "thematic-break",
+            SourceKind::Table => "table",
+            SourceKind::TableHead => "table-head",
+            SourceKind::TableRow => "table-row",
+            SourceKind::TableCell => "table-cell",
+            SourceKind::Image => "image",
+        }
+    }
 }
 
 /// Source information for one rendered HTML element.
@@ -276,8 +304,13 @@ pub struct SourceMap {
 
 impl SourceMap {
     /// Look up one source-map entry by ID.
-    pub fn get(&self, id: SourceId) -> Option<&SourceMapEntry> {
-        self.entries.iter().find(|entry| entry.id == id)
+    pub fn get(&self, id: &SourceId) -> Option<&SourceMapEntry> {
+        self.entries.iter().find(|entry| &entry.id == id)
+    }
+
+    /// Look up one source-map entry by the value read from a `data-sid` attribute.
+    pub fn get_by_sid(&self, sid: &str) -> Option<&SourceMapEntry> {
+        self.entries.iter().find(|entry| entry.id.as_str() == sid)
     }
 }
 
@@ -375,7 +408,9 @@ fn offset_to_end_line(content: &str, end_offset: usize) -> usize {
 struct SourceMapBuilder {
     enabled: bool,
     map: SourceMap,
-    next_id: u32,
+    seen_ids: BTreeMap<String, usize>,
+    next_placeholder: usize,
+    replacements: Vec<(SourceId, SourceId)>,
 }
 
 impl SourceMapBuilder {
@@ -389,11 +424,18 @@ impl SourceMapBuilder {
                     .flatten(),
                 entries: Vec::new(),
             },
-            next_id: 1,
+            seen_ids: BTreeMap::new(),
+            next_placeholder: 1,
+            replacements: Vec::new(),
         }
     }
 
-    fn finish(self) -> SourceMap {
+    fn finish(self, html: &mut String) -> SourceMap {
+        for (placeholder, id) in &self.replacements {
+            let from = format!("data-sid=\"{}\"", placeholder);
+            let to = format!("data-sid=\"{}\"", id);
+            *html = html.replace(&from, &to);
+        }
         self.map
     }
 
@@ -410,19 +452,27 @@ impl SourceMapBuilder {
         range: &Range<usize>,
         markdown: &str,
     ) -> (Option<SourceId>, String) {
-        let Some(id) = self.push_entry(kind, range.clone(), markdown) else {
+        let Some(id) = self.push_open_entry(kind, range.clone(), markdown) else {
             return (None, String::new());
         };
-        (Some(id), format!(" data-sid=\"{}\"", id))
+        let attrs = format!(" data-sid=\"{}\"", id);
+        (Some(id), attrs)
     }
 
     fn close(&mut self, id: Option<SourceId>, range: &Range<usize>, markdown: &str) {
         let Some(id) = id else {
             return;
         };
-        let Some(entry) = self.map.get_mut(id) else {
+        let Some(index) = self.map.entry_index(&id) else {
             return;
         };
+        let kind = self.map.entries[index].kind;
+        let source_range = self.map.entries[index].byte_start..range.end;
+        let final_id = self.source_id(kind, &source_range, markdown);
+        let placeholder = std::mem::replace(&mut self.map.entries[index].id, final_id.clone());
+        self.replacements.push((placeholder, final_id));
+
+        let entry = &mut self.map.entries[index];
         entry.byte_end = range.end;
         entry.line_end = offset_to_end_line(markdown, range.end);
     }
@@ -437,10 +487,9 @@ impl SourceMapBuilder {
             return None;
         }
 
-        let id = SourceId(self.next_id);
-        self.next_id += 1;
+        let id = self.source_id(kind, &range, markdown);
         self.map.entries.push(SourceMapEntry {
-            id,
+            id: id.clone(),
             kind,
             line_start: offset_to_line(markdown, range.start),
             line_end: offset_to_end_line(markdown, range.end),
@@ -449,13 +498,72 @@ impl SourceMapBuilder {
         });
         Some(id)
     }
+
+    fn push_open_entry(
+        &mut self,
+        kind: SourceKind,
+        range: Range<usize>,
+        markdown: &str,
+    ) -> Option<SourceId> {
+        if !self.enabled {
+            return None;
+        }
+
+        let id = self.placeholder_id();
+        self.map.entries.push(SourceMapEntry {
+            id: id.clone(),
+            kind,
+            line_start: offset_to_line(markdown, range.start),
+            line_end: offset_to_end_line(markdown, range.end),
+            byte_start: range.start,
+            byte_end: range.end,
+        });
+        Some(id)
+    }
+
+    fn source_id(&mut self, kind: SourceKind, range: &Range<usize>, markdown: &str) -> SourceId {
+        let source = &markdown[range.start..range.end];
+        let base = stable_source_id(kind, source);
+        let count = self.seen_ids.entry(base.clone()).or_default();
+        *count += 1;
+        if *count == 1 {
+            SourceId(base)
+        } else {
+            SourceId(format!("{base}-{}", *count))
+        }
+    }
+
+    fn placeholder_id(&mut self) -> SourceId {
+        let id = SourceId(format!("__marq-source-{}__", self.next_placeholder));
+        self.next_placeholder += 1;
+        id
+    }
 }
 
 impl SourceMap {
-    fn get_mut(&mut self, id: SourceId) -> Option<&mut SourceMapEntry> {
-        let index = id.0.checked_sub(1)? as usize;
-        self.entries.get_mut(index).filter(|entry| entry.id == id)
+    fn entry_index(&self, id: &SourceId) -> Option<usize> {
+        self.entries.iter().position(|entry| &entry.id == id)
     }
+}
+
+fn stable_source_id(kind: SourceKind, source: &str) -> String {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut hash = FNV_OFFSET;
+    for byte in kind
+        .stable_tag()
+        .as_bytes()
+        .iter()
+        .copied()
+        .chain([0])
+        .chain(source.as_bytes().iter().copied())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+
+    format!("s{hash:016x}")
 }
 
 /// Render markdown to HTML.
@@ -1021,6 +1129,8 @@ pub async fn render(markdown: &str, options: &RenderOptions) -> Result<Document>
         _ => None,
     };
 
+    let source_map = source_map.finish(&mut html);
+
     Ok(Document {
         raw_metadata,
         metadata_format,
@@ -1032,7 +1142,7 @@ pub async fn render(markdown: &str, options: &RenderOptions) -> Result<Document>
         elements,
         head_injections: head_injection_map.into_values().collect(),
         inline_code_spans,
-        source_map: source_map.finish(),
+        source_map,
     })
 }
 
@@ -1819,6 +1929,10 @@ mod tests {
         &markdown[entry.byte_start..entry.byte_end]
     }
 
+    fn sid_attr(entry: &SourceMapEntry) -> String {
+        format!(r#"data-sid="{}""#, entry.id)
+    }
+
     #[tokio::test]
     async fn test_render_simple() {
         let md = "# Hello\n\nWorld.";
@@ -2363,23 +2477,33 @@ Third paragraph.
         let opts = RenderOptions::default().with_source_map(true);
         let doc = render(md, &opts).await.unwrap();
 
-        for expected in [
-            r#"<p data-sid="1">"#,
-            r#"<p data-sid="2">"#,
-            r#"<p data-sid="3">"#,
-        ] {
+        let entries = &doc.source_map.entries;
+        assert_eq!(entries.len(), 3);
+
+        for entry in entries {
+            let expected = format!(r#"<p {}>"#, sid_attr(entry));
             assert!(
-                doc.html.contains(expected),
+                doc.html.contains(&expected),
                 "expected {expected:?} in HTML:\n{}",
                 doc.html
             );
         }
 
-        let entries = &doc.source_map.entries;
-        assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].kind, SourceKind::Paragraph);
         assert_eq!(entries[0].line_start, 1);
         assert_eq!(entries[0].line_end, 1);
+        assert_eq!(
+            doc.source_map
+                .get(&entries[0].id)
+                .map(|entry| entry.byte_start),
+            Some(entries[0].byte_start)
+        );
+        assert_eq!(
+            doc.source_map
+                .get_by_sid(entries[0].id.as_str())
+                .map(|entry| entry.byte_start),
+            Some(entries[0].byte_start)
+        );
         assert_eq!(source_text(md, &entries[0]), "First paragraph.\n");
         assert_eq!(entries[1].line_start, 3);
         assert_eq!(entries[1].line_end, 3);
@@ -2400,7 +2524,7 @@ Third paragraph.
         let doc = render(md, &opts).await.unwrap();
 
         assert!(
-            doc.html.contains(r#"data-sid="1""#),
+            doc.html.contains("data-sid"),
             "Should have source ID attribute: {}",
             doc.html
         );
@@ -2460,34 +2584,48 @@ Third paragraph.
         };
         let doc = render(md, &opts).await.unwrap();
 
+        let entries = &doc.source_map.entries;
         for expected in [
-            r#"<h1 id="title" data-sid="1">Title</h1>"#,
-            r#"<ul data-sid="2">"#,
-            r#"<li data-sid="3">"#,
-            r#"<li data-sid="4">"#,
-            r#"<ol data-sid="5">"#,
-            r#"<li data-sid="6">"#,
-            r#"<li data-sid="7">"#,
-            r#"<blockquote data-sid="8">"#,
-            r#"<p data-sid="9">"#,
-            r#"<p data-sid="10"><img data-sid="11""#,
-            r#"<hr data-sid="12" />"#,
-            r#"<table data-sid="13">"#,
-            r#"<thead data-sid="14"><tr data-sid="14">"#,
-            r#"<th data-sid="15">"#,
-            r#"<th data-sid="16" style="text-align: right">"#,
-            r#"<tr data-sid="17">"#,
-            r#"<td data-sid="18">"#,
-            r#"<td data-sid="19" style="text-align: right">"#,
+            format!(r#"<h1 id="title" {}>Title</h1>"#, sid_attr(&entries[0])),
+            format!(r#"<ul {}>"#, sid_attr(&entries[1])),
+            format!(r#"<li {}>"#, sid_attr(&entries[2])),
+            format!(r#"<li {}>"#, sid_attr(&entries[3])),
+            format!(r#"<ol {}>"#, sid_attr(&entries[4])),
+            format!(r#"<li {}>"#, sid_attr(&entries[5])),
+            format!(r#"<li {}>"#, sid_attr(&entries[6])),
+            format!(r#"<blockquote {}>"#, sid_attr(&entries[7])),
+            format!(r#"<p {}>"#, sid_attr(&entries[8])),
+            format!(
+                r#"<p {}><img {}"#,
+                sid_attr(&entries[9]),
+                sid_attr(&entries[10])
+            ),
+            format!(r#"<hr {} />"#, sid_attr(&entries[11])),
+            format!(r#"<table {}>"#, sid_attr(&entries[12])),
+            format!(
+                r#"<thead {}><tr {}>"#,
+                sid_attr(&entries[13]),
+                sid_attr(&entries[13])
+            ),
+            format!(r#"<th {}>"#, sid_attr(&entries[14])),
+            format!(
+                r#"<th {} style="text-align: right">"#,
+                sid_attr(&entries[15])
+            ),
+            format!(r#"<tr {}>"#, sid_attr(&entries[16])),
+            format!(r#"<td {}>"#, sid_attr(&entries[17])),
+            format!(
+                r#"<td {} style="text-align: right">"#,
+                sid_attr(&entries[18])
+            ),
         ] {
             assert!(
-                doc.html.contains(expected),
+                doc.html.contains(&expected),
                 "expected {expected:?} in HTML:\n{}",
                 doc.html
             );
         }
 
-        let entries = &doc.source_map.entries;
         let kinds: Vec<SourceKind> = entries.iter().map(|entry| entry.kind).collect();
         assert_eq!(
             kinds,
@@ -2521,6 +2659,112 @@ Third paragraph.
         assert_eq!(entries[7].line_start, 9);
         assert_eq!(entries[11].line_start, 13);
         assert_eq!(entries[12].line_start, 15);
+    }
+
+    #[tokio::test]
+    async fn test_source_ids_are_stable_after_unrelated_insertion() {
+        let before = "First paragraph.\n\nSecond paragraph.\n\nThird paragraph.\n";
+        let after =
+            "Inserted paragraph.\n\nFirst paragraph.\n\nSecond paragraph.\n\nThird paragraph.\n";
+        let opts = RenderOptions::default().with_source_map(true);
+
+        let before_doc = render(before, &opts).await.unwrap();
+        let after_doc = render(after, &opts).await.unwrap();
+
+        for source in [
+            "First paragraph.\n",
+            "Second paragraph.\n",
+            "Third paragraph.\n",
+        ] {
+            let before_id = before_doc
+                .source_map
+                .entries
+                .iter()
+                .find(|entry| source_text(before, entry) == source)
+                .map(|entry| entry.id.clone())
+                .unwrap();
+            let after_id = after_doc
+                .source_map
+                .entries
+                .iter()
+                .find(|entry| source_text(after, entry) == source)
+                .map(|entry| entry.id.clone())
+                .unwrap();
+
+            assert_eq!(before_id, after_id, "source ID changed for {source:?}");
+        }
+
+        assert!(!before_doc.html.contains("__marq-source"));
+        assert!(!after_doc.html.contains("__marq-source"));
+    }
+
+    #[tokio::test]
+    async fn test_block_source_ids_use_full_source_span() {
+        let before = "- alpha\n- beta\n\nTail paragraph.\n";
+        let after = "Intro paragraph.\n\n- alpha\n- beta\n\nTail paragraph.\n";
+        let opts = RenderOptions::default().with_source_map(true);
+
+        let before_doc = render(before, &opts).await.unwrap();
+        let after_doc = render(after, &opts).await.unwrap();
+
+        for (kind, source) in [
+            (SourceKind::List, "- alpha\n- beta\n\n"),
+            (SourceKind::ListItem, "- alpha\n"),
+            (SourceKind::ListItem, "- beta\n\n"),
+            (SourceKind::Paragraph, "Tail paragraph.\n"),
+        ] {
+            let before_entries: Vec<_> = before_doc
+                .source_map
+                .entries
+                .iter()
+                .map(|entry| (entry.kind, source_text(before, entry).to_string()))
+                .collect();
+            let after_entries: Vec<_> = after_doc
+                .source_map
+                .entries
+                .iter()
+                .map(|entry| (entry.kind, source_text(after, entry).to_string()))
+                .collect();
+            let before_id = before_doc
+                .source_map
+                .entries
+                .iter()
+                .find(|entry| entry.kind == kind && source_text(before, entry) == source)
+                .map(|entry| entry.id.clone())
+                .unwrap_or_else(|| {
+                    panic!("missing before {kind:?} {source:?}; entries: {before_entries:?}")
+                });
+            let after_id = after_doc
+                .source_map
+                .entries
+                .iter()
+                .find(|entry| entry.kind == kind && source_text(after, entry) == source)
+                .map(|entry| entry.id.clone())
+                .unwrap_or_else(|| {
+                    panic!("missing after {kind:?} {source:?}; entries: {after_entries:?}")
+                });
+
+            assert_eq!(
+                before_id, after_id,
+                "source ID changed for {kind:?} {source:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_source_ids_get_document_scoped_suffixes() {
+        let md = "Same paragraph.\n\nSame paragraph.\n";
+        let opts = RenderOptions::default().with_source_map(true);
+        let doc = render(md, &opts).await.unwrap();
+
+        let entries = &doc.source_map.entries;
+        assert_eq!(entries.len(), 2);
+        assert_ne!(entries[0].id, entries[1].id);
+        assert!(
+            entries[1].id.as_str().ends_with("-2"),
+            "expected duplicate suffix in {:?}",
+            entries[1].id
+        );
     }
 
     // =========================================================================
