@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.0.0-rc.0](https://github.com/bearcove/marq/compare/v4.0.1...v5.0.0-rc.0) - 2026-06-09
+
+### Other
+
+- prepare marq 5.0.0-rc.0
+- use node 24 action runtimes
+- configure actionlint
+- use bearcove linux runners
+
 ## [4.0.1](https://github.com/bearcove/marq/compare/v4.0.0...v4.0.1) - 2026-05-25
 
 ### Fixed
