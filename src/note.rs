@@ -87,6 +87,32 @@ pub fn parse_note(block: &str) -> Option<Note> {
     })
 }
 
+/// Serialize a note to its canonical `<!-- note … -->` comment form.
+///
+/// Round-trips with [`parse_note`]. Returns `None` when `body` contains the
+/// comment terminator `-->`, which cannot be represented inside an HTML comment.
+pub fn to_comment(meta: &NoteMeta, body: &str) -> Option<String> {
+    if body.contains("-->") {
+        return None;
+    }
+
+    let mut out = String::from("<!-- note\n");
+
+    // Only emit a frontmatter block when there is metadata to carry; a bare
+    // note (just a body) parses back fine without one.
+    let fm = facet_toml::to_string(meta).unwrap_or_default();
+    let fm = fm.trim();
+    if !fm.is_empty() {
+        out.push_str("+++\n");
+        out.push_str(fm);
+        out.push_str("\n+++\n");
+    }
+
+    out.push_str(body.trim());
+    out.push_str("\n-->");
+    Some(out)
+}
+
 /// Wrap already-rendered body HTML in the note's `<aside>` element.
 ///
 /// Emits `data-kind` / `data-author` attributes (when present) so a stylesheet
@@ -140,6 +166,33 @@ mod tests {
         assert!(parse_note("<!-- TODO: fix this -->").is_none());
         assert!(parse_note("<!-- notebook entry -->").is_none());
         assert!(parse_note("<div>not a comment</div>").is_none());
+    }
+
+    #[test]
+    fn to_comment_round_trips_with_meta() {
+        let meta = NoteMeta {
+            author: Some("amos".into()),
+            kind: Some("question".into()),
+        };
+        let comment = to_comment(&meta, "Why **clamp** here?").expect("serializable");
+        let parsed = parse_note(&comment).expect("round-trips");
+        assert_eq!(parsed.meta.author.as_deref(), Some("amos"));
+        assert_eq!(parsed.meta.kind.as_deref(), Some("question"));
+        assert_eq!(parsed.body, "Why **clamp** here?");
+    }
+
+    #[test]
+    fn to_comment_round_trips_bare() {
+        let comment = to_comment(&NoteMeta::default(), "just a thought").expect("serializable");
+        let parsed = parse_note(&comment).expect("round-trips");
+        assert!(parsed.meta.author.is_none());
+        assert!(parsed.meta.kind.is_none());
+        assert_eq!(parsed.body, "just a thought");
+    }
+
+    #[test]
+    fn to_comment_rejects_terminator_in_body() {
+        assert!(to_comment(&NoteMeta::default(), "has --> inside").is_none());
     }
 
     #[test]
