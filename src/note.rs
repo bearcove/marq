@@ -45,6 +45,11 @@ pub struct NoteMeta {
     /// Creation timestamp (RFC 3339), for rendering a byline date.
     #[facet(default)]
     pub created: Option<String>,
+
+    /// Whether the thread is resolved. Set on the thread's root note; resolved
+    /// threads are hidden by default in the dev overlay.
+    #[facet(default)]
+    pub resolved: Option<bool>,
 }
 
 /// A parsed inline note: its metadata plus the raw markdown body.
@@ -124,6 +129,9 @@ pub fn to_comment(meta: &NoteMeta, body: &str) -> Option<String> {
     if let Some(created) = &meta.created {
         obj.insert("created", created.as_str());
     }
+    if let Some(resolved) = meta.resolved {
+        obj.insert("resolved", resolved);
+    }
     if !obj.is_empty()
         && let Ok(fm) = facet_toml::to_string(&obj.into_value())
     {
@@ -193,6 +201,9 @@ pub fn render_aside(meta: &NoteMeta, body_html: &str) -> String {
     }
     if let Some(created) = &meta.created {
         out.push_str(&format!(" data-created=\"{}\"", attr_escape(created)));
+    }
+    if meta.resolved == Some(true) {
+        out.push_str(" data-resolved=\"true\"");
     }
     out.push('>');
     out.push_str(body_html);
@@ -281,6 +292,20 @@ mod tests {
     #[test]
     fn to_comment_rejects_terminator_in_body() {
         assert!(to_comment(&NoteMeta::default(), "has --> inside").is_none());
+    }
+
+    #[test]
+    fn to_comment_round_trips_resolved() {
+        let meta = NoteMeta {
+            id: Some("t1".into()),
+            resolved: Some(true),
+            ..Default::default()
+        };
+        let comment = to_comment(&meta, "done").expect("serializable");
+        let parsed = parse_note(&comment).expect("round-trips");
+        assert_eq!(parsed.meta.id.as_deref(), Some("t1"));
+        assert_eq!(parsed.meta.resolved, Some(true));
+        assert!(render_aside(&parsed.meta, "<p>x</p>").contains("data-resolved=\"true\""));
     }
 
     #[test]
