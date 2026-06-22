@@ -98,14 +98,26 @@ pub fn to_comment(meta: &NoteMeta, body: &str) -> Option<String> {
 
     let mut out = String::from("<!-- note\n");
 
-    // Only emit a frontmatter block when there is metadata to carry; a bare
-    // note (just a body) parses back fine without one.
-    let fm = facet_toml::to_string(meta).unwrap_or_default();
-    let fm = fm.trim();
-    if !fm.is_empty() {
-        out.push_str("+++\n");
-        out.push_str(fm);
-        out.push_str("\n+++\n");
+    // Build an object of only the present fields and serialize that: facet-toml
+    // refuses to emit `null`, so serializing `NoteMeta` directly fails whenever a
+    // field is `None`. A bare note (no metadata) parses back fine without any
+    // frontmatter block.
+    let mut obj = facet_value::VObject::new();
+    if let Some(author) = &meta.author {
+        obj.insert("author", author.as_str());
+    }
+    if let Some(kind) = &meta.kind {
+        obj.insert("kind", kind.as_str());
+    }
+    if !obj.is_empty()
+        && let Ok(fm) = facet_toml::to_string(&obj.into_value())
+    {
+        let fm = fm.trim();
+        if !fm.is_empty() {
+            out.push_str("+++\n");
+            out.push_str(fm);
+            out.push_str("\n+++\n");
+        }
     }
 
     out.push_str(body.trim());
@@ -188,6 +200,23 @@ mod tests {
         assert!(parsed.meta.author.is_none());
         assert!(parsed.meta.kind.is_none());
         assert_eq!(parsed.body, "just a thought");
+    }
+
+    /// A note with only `kind` set (the common case from the overlay, which
+    /// never sends an author) must keep its frontmatter — facet-toml refuses to
+    /// serialize the absent `author`, so `to_comment` serializes present fields
+    /// only.
+    #[test]
+    fn to_comment_round_trips_partial_meta() {
+        let meta = NoteMeta {
+            author: None,
+            kind: Some("question".into()),
+        };
+        let comment = to_comment(&meta, "body").expect("serializable");
+        let parsed = parse_note(&comment).expect("round-trips");
+        assert!(parsed.meta.author.is_none());
+        assert_eq!(parsed.meta.kind.as_deref(), Some("question"));
+        assert_eq!(parsed.body, "body");
     }
 
     #[test]
