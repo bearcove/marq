@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.0.0-rc.1](https://github.com/bearcove/marq/compare/v5.0.0-rc.0...v5.0.0-rc.1) - 2026-06-22
+
+### Other
+
+- add resolved flag to NoteMeta (data-resolved on aside)
+- add id + created to NoteMeta; link mark<->note via data-note-id
+- Add note highlight marks (<dodeca-mark>), stripped in production
+- Fix to_comment dropping metadata when a field is None
+- Add marq::to_comment to serialize notes (round-trips with parse_note)
+- Add inline note rendering (<!-- note --> comments)
+- Point readers to Dodeca
+
 ## [4.0.1](https://github.com/bearcove/marq/compare/v4.0.0...v4.0.1) - 2026-05-25
 
 ### Fixed
