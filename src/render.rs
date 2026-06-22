@@ -1294,6 +1294,12 @@ pub async fn render(markdown: &str, options: &RenderOptions) -> Result<Document>
 
     let source_map = source_map.finish(&mut html);
 
+    // In production (notes off), strip note highlight wrappers so they leave no
+    // trace in the served HTML. Note comments are already stripped inline above.
+    if !options.render_notes {
+        html = crate::note::strip_marks(&html);
+    }
+
     Ok(Document {
         raw_metadata,
         metadata_format,

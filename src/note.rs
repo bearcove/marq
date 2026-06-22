@@ -125,6 +125,27 @@ pub fn to_comment(meta: &NoteMeta, body: &str) -> Option<String> {
     Some(out)
 }
 
+/// The custom element used to highlight the exact span a note refers to.
+///
+/// Authored into the markdown source around the annotated text. In development
+/// (`render_notes`) it is left in the rendered HTML for the dev overlay's CSS to
+/// highlight; in production it is stripped by [`strip_marks`] so it leaves no
+/// trace (not even in view-source).
+pub const MARK_TAG: &str = "dodeca-mark";
+
+/// Wrap an inline span of markdown source in a note highlight element.
+pub fn wrap_mark(inner: &str) -> String {
+    format!("<{MARK_TAG}>{inner}</{MARK_TAG}>")
+}
+
+/// Remove `<dodeca-mark>` / `</dodeca-mark>` tags from rendered HTML, keeping the
+/// inner content. Used in production (`render_notes` off) so note highlights
+/// leave no trace in the served HTML.
+pub fn strip_marks(html: &str) -> String {
+    html.replace(&format!("<{MARK_TAG}>"), "")
+        .replace(&format!("</{MARK_TAG}>"), "")
+}
+
 /// Wrap already-rendered body HTML in the note's `<aside>` element.
 ///
 /// Emits `data-kind` / `data-author` attributes (when present) so a stylesheet
@@ -222,6 +243,15 @@ mod tests {
     #[test]
     fn to_comment_rejects_terminator_in_body() {
         assert!(to_comment(&NoteMeta::default(), "has --> inside").is_none());
+    }
+
+    #[test]
+    fn wrap_and_strip_marks_round_trip() {
+        let wrapped = wrap_mark("hello **world**");
+        assert_eq!(wrapped, "<dodeca-mark>hello **world**</dodeca-mark>");
+        assert_eq!(strip_marks(&wrapped), "hello **world**");
+        // Stripping leaves non-mark HTML untouched.
+        assert_eq!(strip_marks("<p>x</p>"), "<p>x</p>");
     }
 
     #[test]
