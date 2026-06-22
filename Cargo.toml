@@ -1,6 +1,6 @@
 [package]
 name = "marq"
-version = "5.0.0-rc.0"
+version = "5.0.0-rc.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Markdown rendering with pluggable code block handlers"
