@@ -36,6 +36,15 @@ pub struct NoteMeta {
     /// Free-form kind used for styling (e.g. `note`, `question`, `todo`).
     #[facet(default)]
     pub kind: Option<String>,
+
+    /// Thread id linking this note to its highlight (`<dodeca-mark>`) and to any
+    /// replies (further notes sharing the same id).
+    #[facet(default)]
+    pub id: Option<String>,
+
+    /// Creation timestamp (RFC 3339), for rendering a byline date.
+    #[facet(default)]
+    pub created: Option<String>,
 }
 
 /// A parsed inline note: its metadata plus the raw markdown body.
@@ -109,6 +118,12 @@ pub fn to_comment(meta: &NoteMeta, body: &str) -> Option<String> {
     if let Some(kind) = &meta.kind {
         obj.insert("kind", kind.as_str());
     }
+    if let Some(id) = &meta.id {
+        obj.insert("id", id.as_str());
+    }
+    if let Some(created) = &meta.created {
+        obj.insert("created", created.as_str());
+    }
     if !obj.is_empty()
         && let Ok(fm) = facet_toml::to_string(&obj.into_value())
     {
@@ -133,17 +148,32 @@ pub fn to_comment(meta: &NoteMeta, body: &str) -> Option<String> {
 /// trace (not even in view-source).
 pub const MARK_TAG: &str = "dodeca-mark";
 
-/// Wrap an inline span of markdown source in a note highlight element.
-pub fn wrap_mark(inner: &str) -> String {
-    format!("<{MARK_TAG}>{inner}</{MARK_TAG}>")
+/// Wrap an inline span of markdown source in a note highlight element, linked to
+/// its note thread by `id` (emitted as `data-note-id`).
+pub fn wrap_mark(inner: &str, id: Option<&str>) -> String {
+    match id {
+        Some(id) => format!(
+            "<{MARK_TAG} data-note-id=\"{}\">{inner}</{MARK_TAG}>",
+            attr_escape(id)
+        ),
+        None => format!("<{MARK_TAG}>{inner}</{MARK_TAG}>"),
+    }
 }
 
-/// Remove `<dodeca-mark>` / `</dodeca-mark>` tags from rendered HTML, keeping the
-/// inner content. Used in production (`render_notes` off) so note highlights
-/// leave no trace in the served HTML.
+/// Remove `<dodeca-mark …>` / `</dodeca-mark>` tags (with or without attributes)
+/// from rendered HTML, keeping the inner content. Used in production
+/// (`render_notes` off) so note highlights leave no trace in the served HTML.
 pub fn strip_marks(html: &str) -> String {
-    html.replace(&format!("<{MARK_TAG}>"), "")
-        .replace(&format!("</{MARK_TAG}>"), "")
+    let mut out = html.replace(&format!("</{MARK_TAG}>"), "");
+    let open = format!("<{MARK_TAG}");
+    while let Some(start) = out.find(&open) {
+        // Drop everything from `<dodeca-mark` up to and including the next `>`.
+        match out[start..].find('>') {
+            Some(rel_end) => out.replace_range(start..start + rel_end + 1, ""),
+            None => break,
+        }
+    }
+    out
 }
 
 /// Wrap already-rendered body HTML in the note's `<aside>` element.
@@ -152,11 +182,17 @@ pub fn strip_marks(html: &str) -> String {
 /// can theme notes by kind and show a byline.
 pub fn render_aside(meta: &NoteMeta, body_html: &str) -> String {
     let mut out = String::from("<aside class=\"dodeca-note\"");
+    if let Some(id) = &meta.id {
+        out.push_str(&format!(" data-note-id=\"{}\"", attr_escape(id)));
+    }
     if let Some(kind) = &meta.kind {
         out.push_str(&format!(" data-kind=\"{}\"", attr_escape(kind)));
     }
     if let Some(author) = &meta.author {
         out.push_str(&format!(" data-author=\"{}\"", attr_escape(author)));
+    }
+    if let Some(created) = &meta.created {
+        out.push_str(&format!(" data-created=\"{}\"", attr_escape(created)));
     }
     out.push('>');
     out.push_str(body_html);
@@ -206,6 +242,7 @@ mod tests {
         let meta = NoteMeta {
             author: Some("amos".into()),
             kind: Some("question".into()),
+            ..Default::default()
         };
         let comment = to_comment(&meta, "Why **clamp** here?").expect("serializable");
         let parsed = parse_note(&comment).expect("round-trips");
@@ -232,6 +269,7 @@ mod tests {
         let meta = NoteMeta {
             author: None,
             kind: Some("question".into()),
+            ..Default::default()
         };
         let comment = to_comment(&meta, "body").expect("serializable");
         let parsed = parse_note(&comment).expect("round-trips");
@@ -247,9 +285,16 @@ mod tests {
 
     #[test]
     fn wrap_and_strip_marks_round_trip() {
-        let wrapped = wrap_mark("hello **world**");
+        let wrapped = wrap_mark("hello **world**", None);
         assert_eq!(wrapped, "<dodeca-mark>hello **world**</dodeca-mark>");
         assert_eq!(strip_marks(&wrapped), "hello **world**");
+        // With an id (attributes on the open tag) it still strips cleanly.
+        let with_id = wrap_mark("span", Some("abc123"));
+        assert_eq!(
+            with_id,
+            "<dodeca-mark data-note-id=\"abc123\">span</dodeca-mark>"
+        );
+        assert_eq!(strip_marks(&with_id), "span");
         // Stripping leaves non-mark HTML untouched.
         assert_eq!(strip_marks("<p>x</p>"), "<p>x</p>");
     }
@@ -259,6 +304,7 @@ mod tests {
         let meta = NoteMeta {
             author: Some("amos".into()),
             kind: Some("question".into()),
+            ..Default::default()
         };
         let html = render_aside(&meta, "<p>hi</p>");
         assert_eq!(
